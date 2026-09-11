@@ -2,7 +2,6 @@
 const http = require("http");
 const path = require("path");
 const fs = require("fs");
-const url = require("url");
 
 const PORT = process.env.PORT || 5000;
 
@@ -59,16 +58,22 @@ function getBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
+
   patchRes(res);
 
-  const parsed = url.parse(req.url, true);
-  const pathname = parsed.pathname;
-  req.query = parsed.query;
+  const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
+  const pathname = parsedUrl.pathname;
+
+  req.query = Object.fromEntries(
+    parsedUrl.searchParams.entries()
+  );
+
   req.headers = req.headers || {};
 
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+
 
   if (req.method === "OPTIONS") {
     res.statusCode = 200;
