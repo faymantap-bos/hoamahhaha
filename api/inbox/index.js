@@ -3,6 +3,7 @@ const Inbox = require("../../lib/models/Inbox");
 const Email = require("../../lib/models/Email");
 const Log = require("../../lib/models/Log");
 const config = require("../../config");
+
 const {
   generateUsername,
   generateSessionId,
@@ -14,47 +15,138 @@ const {
 } = require("../../lib/utils");
 
 module.exports = async function handler(req, res) {
-  if (req.method === "OPTIONS") return res.status(200).end();
-  await connectDB();
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
 
-  if (req.method === "POST") {
-    return createInbox(req, res);
+  try {
+    await connectDB();
+
+    if (req.method === "POST") {
+      return createInbox(req, res);
+    }
+
+    if (req.method === "GET") {
+      return getInbox(req, res);
+    }
+
+    return errorResponse(res, "Method not allowed", 405);
+  } catch (err) {
+    console.error("Inbox handler error:", err);
+    return errorResponse(res, "Internal server error", 500);
   }
-  if (req.method === "GET") {
-    return getInbox(req, res);
-  }
-  return errorResponse(res, "Method not allowed", 405);
 };
 
 async function createInbox(req, res) {
   try {
     const ip = getClientIP(req);
-    const { username, domain, sessionId: existingSession } = req.body || {};
+    const body = req.body || {};
 
-    const activeDomains = config.domains;
-    const chosenDomain = activeDomains.includes(domain) ? domain : getRandomDomain(activeDomains);
-    const chosenUsername = (username && /^[a-z0-9._-]{3,30}$/.test(username))
-      ? username.toLowerCase()
-      : generateUsername();
+    const {
+      username,
+      domain,
+      sessionId: existingSession
+    } = body;
 
-    const address = generateAddress(chosenUsername, chosenDomain);
-    const sessionId = existingSession || generateSessionId();
+    const now = new Date();
 
-    const existing = await Inbox.findOne({ address });
+    /*
+     * Tandai inbox yang sudah expired sebagai inactive.
+     * Ini mencegah inbox lama terus dihitung dalam rate limit.
+     */
+    await Inbox.updateMany(
+      {
+        active: true,
+        expiresAt: { $lte: now }
+      },
+      {
+        $set: {
+          active: false
+        }
+      }
+    );
+
+    const activeDomains = Array.isArray(config.domains)
+      ? config.domains
+      : [];
+
+    if (activeDomains.length === 0) {
+      return errorResponse(res, "No email domain configured", 500);
+    }
+
+    const chosenDomain =
+      domain && activeDomains.includes(domain)
+        ? domain
+        : getRandomDomain(activeDomains);
+
+    const chosenUsername =
+      username &&
+      /^[a-z0-9._-]{3,30}$/i.test(username)
+        ? username.toLowerCase()
+        : generateUsername();
+
+    const address = generateAddress(
+      chosenUsername,
+      chosenDomain
+    ).toLowerCase();
+
+    const sessionId =
+      existingSession || generateSessionId();
+
+    /*
+     * Jika inbox yang sama masih aktif, kembalikan inbox tersebut.
+     */
+    const existing = await Inbox.findOne({
+      address,
+      active: true,
+      expiresAt: { $gt: now }
+    });
+
     if (existing) {
-      const emails = await Email.find({ inboxId: existing._id, deleted: false })
+      const emails = await Email.find({
+        inboxId: existing._id,
+        deleted: false
+      })
         .select("-html -text -attachments -headers")
         .sort({ receivedAt: -1 })
-        .limit(50);
-      return successResponse(res, { inbox: existing, emails, sessionId: existing.sessionId });
+        .limit(200);
+
+      return successResponse(res, {
+        inbox: existing,
+        emails,
+        sessionId: existing.sessionId
+      });
     }
 
-    const ipCount = await Inbox.countDocuments({ ip, active: true });
-    if (ipCount >= config.inbox.maxInboxPerIP) {
-      return errorResponse(res, "Too many inboxes from this IP", 429);
+    /*
+     * Hitung hanya inbox aktif yang belum expired dari IP ini.
+     */
+    const maxInboxPerIP = Number(
+      config.inbox?.maxInboxPerIP || 200
+    );
+
+    const ipCount = await Inbox.countDocuments({
+      ip,
+      active: true,
+      expiresAt: { $gt: now }
+    });
+
+    if (ipCount >= maxInboxPerIP) {
+      return errorResponse(
+        res,
+        `Too many active inboxes from this IP. Current: ${ipCount}, limit: ${maxInboxPerIP}`,
+        429
+      );
     }
 
-    const expiresAt = new Date(Date.now() + config.inbox.expirationHours * 60 * 60 * 1000);
+    const expirationHours = Number(
+      config.inbox?.expirationHours || 1
+    );
+
+    const expiresAt = new Date(
+      now.getTime() +
+      expirationHours * 60 * 60 * 1000
+    );
 
     const inbox = await Inbox.create({
       address,
@@ -62,34 +154,110 @@ async function createInbox(req, res) {
       domain: chosenDomain,
       sessionId,
       ip,
+      active: true,
       expiresAt
     });
 
-    await Log.create({ type: "inbox", action: "created", ip, target: address });
+    await Log.create({
+      type: "inbox",
+      action: "created",
+      ip,
+      target: address
+    });
 
-    return successResponse(res, { inbox, emails: [], sessionId }, 201);
+    return successResponse(
+      res,
+      {
+        inbox,
+        emails: [],
+        sessionId
+      },
+      201
+    );
   } catch (err) {
     console.error("Create inbox error:", err);
-    return errorResponse(res, "Failed to create inbox", 500);
+
+    if (err.code === 11000) {
+      return errorResponse(
+        res,
+        "Inbox address already exists, please retry",
+        409
+      );
+    }
+
+    return errorResponse(
+      res,
+      "Failed to create inbox",
+      500
+    );
   }
 }
 
 async function getInbox(req, res) {
   try {
-    const { address } = req.query;
-    if (!address) return errorResponse(res, "Address required");
+    const address = String(
+      req.query?.address || ""
+    ).trim().toLowerCase();
 
-    const inbox = await Inbox.findOne({ address: address.toLowerCase(), active: true });
-    if (!inbox) return errorResponse(res, "Inbox not found", 404);
+    if (!address) {
+      return errorResponse(
+        res,
+        "Address required",
+        400
+      );
+    }
 
-    const emails = await Email.find({ inboxId: inbox._id, deleted: false })
+    const now = new Date();
+
+    const inbox = await Inbox.findOne({
+      address,
+      active: true,
+      expiresAt: { $gt: now }
+    });
+
+    if (!inbox) {
+      /*
+       * Jika ditemukan tetapi sudah expired, nonaktifkan.
+       */
+      await Inbox.updateOne(
+        {
+          address,
+          active: true,
+          expiresAt: { $lte: now }
+        },
+        {
+          $set: {
+            active: false
+          }
+        }
+      );
+
+      return errorResponse(
+        res,
+        "Inbox not found or expired",
+        404
+      );
+    }
+
+    const emails = await Email.find({
+      inboxId: inbox._id,
+      deleted: false
+    })
       .select("-attachments -headers")
       .sort({ receivedAt: -1 })
       .limit(100);
 
-    return successResponse(res, { inbox, emails });
+    return successResponse(res, {
+      inbox,
+      emails
+    });
   } catch (err) {
     console.error("Get inbox error:", err);
-    return errorResponse(res, "Failed to get inbox", 500);
+
+    return errorResponse(
+      res,
+      "Failed to get inbox",
+      500
+    );
   }
 }
