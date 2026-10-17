@@ -23,7 +23,7 @@ module.exports = {
   inbox: {
     expirationHours: 24,
     maxEmailsPerInbox: 1000,
-    maxInboxPerIP: 200
+    maxInboxPerIP: 1000
   },
 
   rateLimit: {
